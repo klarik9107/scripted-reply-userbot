@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -27,6 +28,9 @@ class Config:
     api_hash: str
     session_name: str
     target: str  # username (with or without @) or numeric user id, as string
+    authoring_chat: Optional[str]  # chat to watch for live '# name' scenario edits
+    notify_session_name: str  # Telethon session for the '!notify' notifier account
+    notify_target: Optional[str]  # who the notifier account messages
 
     # Typing / pacing behaviour (all overridable via .env).
     read_delay_min: float
@@ -72,6 +76,9 @@ def load_config() -> Config:
     api_hash = os.getenv("API_HASH")
     session_name = os.getenv("SESSION_NAME", "userbot_session")
     target = os.getenv("TARGET_USERNAME_OR_ID")
+    authoring_chat = os.getenv("AUTHORING_CHAT") or None
+    notify_session_name = os.getenv("NOTIFY_SESSION_NAME", "notifier_session")
+    notify_target = os.getenv("NOTIFY_TARGET") or None
 
     missing = [
         name
@@ -100,6 +107,9 @@ def load_config() -> Config:
         api_hash=api_hash,  # type: ignore[arg-type]
         session_name=session_name,
         target=target,  # type: ignore[arg-type]
+        authoring_chat=authoring_chat,
+        notify_session_name=notify_session_name,
+        notify_target=notify_target,
         read_delay_min=_get_float("READ_DELAY_MIN", 1.5),
         read_delay_max=_get_float("READ_DELAY_MAX", 4.0),
         typing_chars_per_second=_get_float("TYPING_CHARS_PER_SECOND", 6.0),

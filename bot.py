@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import sys
 from dataclasses import dataclass
@@ -50,13 +51,16 @@ logger = logging.getLogger("scripted_reply_userbot")
 
 @dataclass(frozen=True)
 class ScriptMessage:
-    """One message within a turn: plain text, or a media file with an
-    optional caption. Exactly one of `text`/`media` combinations below is
-    meaningful: text-only messages have media=None; media messages may
-    carry `text` as the caption sent alongside the file."""
+    """One message within a turn: plain text, a media file with an
+    optional caption, or a silent notification. Exactly one of
+    `text`/`media`/`notify` combinations below is meaningful: text-only
+    messages have media=None; media messages may carry `text` as the
+    caption sent alongside the file; `notify` entries send their text to
+    the notifier account's target instead of the scripted chat."""
 
     text: Optional[str] = None
     media: Optional[Path] = None
+    notify: Optional[str] = None
 
 
 # Media file extensions mapped to the "chat action" Telegram shows while
@@ -99,8 +103,10 @@ def load_script(path: Path) -> List[List[ScriptMessage]]:
     Expected format:
         {"turns": [["msg1", "msg2"], ["msg3"], ...]}
     Each turn is a list of 1-3 messages sent back to back. A message is
-    either a plain string (text) or an object:
-        {"media": "media/photo1.jpg", "caption": "optional text"}
+    a plain string (text), an object {"media": "media/photo1.jpg",
+    "caption": "optional text"}, or an object {"notify": "text"} - a
+    silent off-camera notification sent via the notifier account instead
+    of the scripted chat.
     """
     if not path.exists():
         raise FileNotFoundError(f"Script file not found: {path}")
@@ -123,6 +129,8 @@ def load_script(path: Path) -> List[List[ScriptMessage]]:
                 if not raw_msg.strip():
                     raise ValueError(f"Script {path}: turn #{i} contains an empty text message")
                 turn.append(ScriptMessage(text=raw_msg))
+            elif isinstance(raw_msg, dict) and raw_msg.get("notify"):
+                turn.append(ScriptMessage(notify=str(raw_msg["notify"])))
             elif isinstance(raw_msg, dict) and raw_msg.get("media"):
                 media_path = _resolve_media_path(str(raw_msg["media"]), path)
                 if not media_path.exists():
@@ -173,8 +181,24 @@ async def send_single_message(
     chat_id: int,
     message: ScriptMessage,
     cfg: Config,
+    notify_client: Optional[TelegramClient] = None,
+    notify_target=None,
 ) -> None:
-    """Show the appropriate chat action, then send one text or media message."""
+    """Show the appropriate chat action, then send one text or media message
+    - or, for a `notify` entry, silently deliver it via the notifier
+    account instead of showing anything in the scripted chat."""
+    if message.notify is not None:
+        if notify_client is None or notify_target is None:
+            logger.warning(
+                "Script has a '!notify' entry but no notifier account is configured "
+                "(set NOTIFY_TARGET / log in the notifier session); skipping: %r",
+                message.notify,
+            )
+            return
+        await notify_client.send_message(notify_target, message.notify)
+        logger.info("Sent off-camera notification: %r", message.notify)
+        return
+
     duration = compute_action_duration(message, cfg)
 
     if message.media is not None:
@@ -217,12 +241,16 @@ class ScriptPlayer:
         script_name: str,
         turns: List[List[ScriptMessage]],
         state_store: StateStore,
+        notify_client: Optional[TelegramClient] = None,
+        notify_target=None,
     ) -> None:
         self.client = client
         self.cfg = cfg
         self.script_name = script_name
         self.turns = turns
         self.state_store = state_store
+        self.notify_client = notify_client
+        self.notify_target = notify_target
         self._lock = asyncio.Lock()
 
     def _load_state(self) -> ScriptState:
@@ -231,13 +259,28 @@ class ScriptPlayer:
     def _save_state(self, state: ScriptState) -> None:
         self.state_store.save(self.cfg.session_name, self.script_name, state)
 
+    async def load_script(self, script_name: str, turns: List[List[ScriptMessage]]) -> None:
+        """Hot-swap the active script and reset progress to turn 0, so a
+        newly (re)written scenario is ready to play from the start on the
+        very next incoming message - no restart needed."""
+        async with self._lock:
+            self.script_name = script_name
+            self.turns = turns
+            self.state_store.reset(self.cfg.session_name, script_name)
+
     async def handle_incoming(self, event: events.NewMessage.Event) -> None:
-        chat_id = event.chat_id
+        # Use the input entity straight from the event, which carries the
+        # access_hash Telethon needs to send a reply. A bare numeric chat_id
+        # isn't enough if this session hasn't independently cached that
+        # entity (e.g. target configured as a numeric id with no prior
+        # dialog/contact history).
+        chat_id = await event.get_input_chat()
+        log_chat_id = event.chat_id
         text = (event.raw_text or "").strip()
 
         if text == RESET_COMMAND:
             self.reset()
-            logger.info("Received reset command from target in chat %s; progress reset to turn 0", chat_id)
+            logger.info("Received reset command from target in chat %s; progress reset to turn 0", log_chat_id)
             # Silently acknowledge with a reaction instead of a visible reply,
             # so the mechanic isn't revealed in the chat.
             try:
@@ -254,13 +297,13 @@ class ScriptPlayer:
                     self.script_name,
                     state.turn_index,
                     len(self.turns),
-                    chat_id,
+                    log_chat_id,
                 )
                 return
 
-            await self._play_turn(chat_id, state)
+            await self._play_turn(chat_id, state, log_chat_id)
 
-    async def _play_turn(self, chat_id: int, state: ScriptState) -> None:
+    async def _play_turn(self, chat_id, state: ScriptState, log_chat_id: int) -> None:
         turn = self.turns[state.turn_index]
         resuming_mid_turn = state.message_index > 0
 
@@ -271,7 +314,7 @@ class ScriptPlayer:
             state.message_index + 1,
             len(turn),
             self.script_name,
-            chat_id,
+            log_chat_id,
         )
 
         if not resuming_mid_turn:
@@ -283,7 +326,14 @@ class ScriptPlayer:
             await asyncio.sleep(read_delay)
 
         for i in range(state.message_index, len(turn)):
-            await send_single_message(self.client, chat_id, turn[i], self.cfg)
+            await send_single_message(
+                self.client,
+                chat_id,
+                turn[i],
+                self.cfg,
+                notify_client=self.notify_client,
+                notify_target=self.notify_target,
+            )
             # Save after every individual message so a crash mid-turn
             # resumes from the next unsent message, not from scratch.
             self._save_state(ScriptState(turn_index=state.turn_index, message_index=i + 1))
@@ -312,6 +362,44 @@ async def resolve_target_id(client: TelegramClient, target: str) -> int:
     if not isinstance(entity, User):
         raise ConfigError(f"TARGET_USERNAME_OR_ID={target!r} does not resolve to a user")
     return entity.id
+
+
+# --------------------------------------------------------------------------
+# Live script reloading from the authoring chat
+# --------------------------------------------------------------------------
+
+AUTHORING_FETCH_LIMIT = 2000
+
+
+async def _reload_active_script_from_authoring_chat(
+    client: TelegramClient, cfg: Config, player: "ScriptPlayer", authoring_entity: str
+) -> None:
+    """Re-parse the authoring chat and, if it defines any '# name' scenario,
+    make the most recently written one the active script - so the moment
+    you finish sending a scenario there, the bot is ready to play it back
+    on the very next message from the target."""
+    scripts = await fetch_scripts_from_chat(client, cfg, authoring_entity, AUTHORING_FETCH_LIMIT)
+    if not scripts:
+        return
+
+    name = next(reversed(scripts))
+    turns_raw = scripts[name]
+    if not turns_raw:
+        logger.warning("Latest scenario %r in authoring chat has no turns yet; not switching.", name)
+        return
+
+    out_path = cfg.scripts_dir / f"{name}.json"
+    out_path.write_text(
+        json.dumps({"turns": turns_raw}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    turns = load_script(out_path)  # validate + convert to ScriptMessage objects
+
+    await player.load_script(name, turns)
+    logger.info(
+        "Live-switched to scenario %r (%d turns) from authoring chat, ready from turn 0",
+        name,
+        len(turns),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +453,29 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
     target_id = await resolve_target_id(client, cfg.target)
     logger.info("Resolved target %r to user id %s", cfg.target, target_id)
 
-    player = ScriptPlayer(client, cfg, script_name, turns, state_store)
+    notify_client: Optional[TelegramClient] = None
+    notify_target = None
+    if cfg.notify_target:
+        notify_client = TelegramClient(cfg.notify_session_name, cfg.api_id, cfg.api_hash)
+        await notify_client.connect()
+        if not await notify_client.is_user_authorized():
+            logger.error(
+                "Notifier session %r is not authorized. Log in with it once "
+                "(e.g. temporarily set SESSION_NAME=%s and run 'run') before "
+                "using '!notify' in scripts. Notifications are disabled for now.",
+                cfg.notify_session_name,
+                cfg.notify_session_name,
+            )
+            await notify_client.disconnect()
+            notify_client = None
+        else:
+            notify_target_raw = cfg.notify_target.strip()
+            notify_target = await notify_client.get_entity(
+                notify_target_raw if notify_target_raw.startswith("@") else f"@{notify_target_raw}"
+            )
+            logger.info("Notifier account ready; '!notify' lines will be sent to %r", cfg.notify_target)
+
+    player = ScriptPlayer(client, cfg, script_name, turns, state_store, notify_client, notify_target)
 
     @client.on(events.NewMessage(incoming=True))
     async def _handler(event: events.NewMessage.Event) -> None:  # noqa: ANN401
@@ -377,6 +487,24 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
         except Exception:  # noqa: BLE001 - keep the bot alive on per-message errors
             logger.exception("Error while handling incoming message from target")
 
+    if cfg.authoring_chat:
+        authoring_entity = (
+            "me" if cfg.authoring_chat.strip().lower() == "me" else cfg.authoring_chat.strip()
+        )
+
+        @client.on(events.NewMessage(chats=authoring_entity, outgoing=True))
+        async def _authoring_handler(event: events.NewMessage.Event) -> None:  # noqa: ANN401
+            try:
+                await _reload_active_script_from_authoring_chat(client, cfg, player, authoring_entity)
+            except Exception:  # noqa: BLE001 - keep the bot alive on per-message errors
+                logger.exception("Error while reloading script from authoring chat")
+
+        logger.info(
+            "Watching authoring chat %r - the latest '# name' scenario written there "
+            "goes live immediately, no restart needed.",
+            cfg.authoring_chat,
+        )
+
     logger.info(
         "scripted-reply-userbot is running. script=%r session=%r target=%r. Press Ctrl+C to stop.",
         script_name,
@@ -385,23 +513,27 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
     )
 
     retries_left = cfg.reconnect_retries
-    while True:
-        try:
-            await client.run_until_disconnected()
-            break  # clean disconnect (e.g. log_out), stop the loop
-        except (ConnectionError, OSError) as exc:
-            if retries_left <= 0:
-                logger.error("Exhausted reconnect attempts; giving up. Last error: %s", exc)
-                raise
-            retries_left -= 1
-            logger.warning(
-                "Connection lost (%s). Reconnecting in %.1fs (%d attempts left)...",
-                exc,
-                cfg.reconnect_delay,
-                retries_left,
-            )
-            await asyncio.sleep(cfg.reconnect_delay)
-            await client.connect()
+    try:
+        while True:
+            try:
+                await client.run_until_disconnected()
+                break  # clean disconnect (e.g. log_out), stop the loop
+            except (ConnectionError, OSError) as exc:
+                if retries_left <= 0:
+                    logger.error("Exhausted reconnect attempts; giving up. Last error: %s", exc)
+                    raise
+                retries_left -= 1
+                logger.warning(
+                    "Connection lost (%s). Reconnecting in %.1fs (%d attempts left)...",
+                    exc,
+                    cfg.reconnect_delay,
+                    retries_left,
+                )
+                await asyncio.sleep(cfg.reconnect_delay)
+                await client.connect()
+    finally:
+        if notify_client is not None:
+            await notify_client.disconnect()
 
 
 # --------------------------------------------------------------------------
@@ -481,6 +613,200 @@ def reset_command(script_arg: str) -> None:
     state_store = StateStore(cfg.state_dir)
     state_store.reset(cfg.session_name, script_path.stem)
     click.echo(f"Progress reset for script {script_path.stem!r} (session {cfg.session_name!r}).")
+
+
+SCRIPT_HEADER_PREFIX = "#"
+TURN_DELIMITER = "-"
+NOTIFY_PREFIX = "!notify"
+
+
+def _slugify_script_name(raw: str) -> str:
+    slug = "".join(c if c.isalnum() else "_" for c in raw.strip().lower())
+    slug = "_".join(filter(None, slug.split("_")))
+    return slug or "untitled"
+
+
+@cli.command("export-script")
+@click.option(
+    "--from",
+    "from_chat",
+    required=True,
+    help="Chat to export from: @username, numeric id, or 'me' for Saved Messages",
+)
+@click.option(
+    "--name",
+    "script_name",
+    default=None,
+    help="Only export the section headed '# <name>'. Omit to export every "
+    "'# ...' section found in the chat.",
+)
+@click.option("--limit", default=1000, show_default=True, help="Max number of messages to scan")
+def export_script_command(from_chat: str, script_name: Optional[str], limit: int) -> None:
+    """Turn messages you wrote in a Telegram chat into one or more script JSON files.
+
+    Write your scenario(s) as plain messages in a chat (e.g. a private
+    channel or group with just yourself): start each scenario with a line
+    '# scenario_name', separate turns with a line that is just '-'.
+    Handy for writing scenarios from your phone - run this once from a PC
+    to generate scripts/<name>.json for each section found.
+    """
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    try:
+        asyncio.run(_export_script(cfg, from_chat, script_name, limit))
+    except AuthKeyUnregisteredError:
+        logger.error(
+            "The saved session is no longer valid (revoked or logged out elsewhere). "
+            "Delete the .session file and run 'run' once to log in interactively."
+        )
+        sys.exit(1)
+
+
+async def fetch_scripts_from_chat(
+    client: TelegramClient, cfg: Config, from_chat: str, limit: int
+) -> "dict[str, List[List[dict]]]":
+    """Fetch and parse every '# name' scenario section out of a chat's
+    message history. Shared by the one-shot 'export-script' command and the
+    live authoring-chat watcher in 'run'.
+    """
+    entity = "me" if from_chat.strip().lower() == "me" else from_chat.strip()
+    messages = [
+        msg
+        async for msg in client.iter_messages(entity, limit=limit, reverse=True)
+        if msg.out and (msg.text or msg.media)
+    ]
+    return await _parse_scripts_from_messages(client, cfg, messages)
+
+
+async def _parse_scripts_from_messages(
+    client: TelegramClient, cfg: Config, messages: list
+) -> "dict[str, List[List[dict]]]":
+    # A single Telegram message may itself contain multiple newline-separated
+    # lines (very common when typing on a phone: each Enter starts a new
+    # line, and the whole block is sent as one message). Flatten every
+    # message into a stream of tokens - one per line for text, one for each
+    # media message - so '# name' headers and '-' delimiters are recognised
+    # regardless of whether they arrived as separate messages or as lines
+    # within one message.
+    tokens: List[tuple] = []
+    for msg in messages:
+        if msg.media:
+            caption = (msg.text or "").strip() or None
+            tokens.append(("media", msg, caption))
+        else:
+            for line in (msg.text or "").splitlines():
+                line = line.strip()
+                if line:
+                    tokens.append(("text", line))
+
+    scripts: "dict[str, List[List[dict]]]" = {}
+    current_name: Optional[str] = None
+
+    for token in tokens:
+        kind = token[0]
+        text = token[1] if kind == "text" else None
+
+        if kind == "text" and text.startswith(SCRIPT_HEADER_PREFIX):
+            current_name = _slugify_script_name(text[len(SCRIPT_HEADER_PREFIX):])
+            scripts[current_name] = [[]]
+            continue
+
+        if current_name is None:
+            continue  # ignore stray content before the first '# name' header
+
+        turns = scripts[current_name]
+
+        if kind == "text" and text == TURN_DELIMITER:
+            if turns[-1]:
+                turns.append([])
+            continue
+
+        if kind == "text" and text.startswith(NOTIFY_PREFIX):
+            if len(turns[-1]) >= 3:
+                turns.append([])
+            notify_text = text[len(NOTIFY_PREFIX):].strip()
+            if notify_text:
+                turns[-1].append({"notify": notify_text})
+            continue
+
+        if len(turns[-1]) >= 3:
+            turns.append([])
+
+        if kind == "media":
+            _, msg, caption = token
+            media_dir = cfg.scripts_dir / "media" / current_name
+            media_dir.mkdir(parents=True, exist_ok=True)
+            saved_path = await _download_message_media(client, msg, media_dir)
+            entry: dict = {"media": f"media/{current_name}/{saved_path.name}"}
+            if caption:
+                entry["caption"] = caption
+            turns[-1].append(entry)
+        else:
+            turns[-1].append(text)
+
+    # Drop any trailing empty turn left over from a dangling '-'.
+    for turns in scripts.values():
+        if turns and not turns[-1]:
+            turns.pop()
+
+    return scripts
+
+
+async def _export_script(
+    cfg: Config, from_chat: str, script_name: Optional[str], limit: int
+) -> None:
+    client = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise ConfigError(
+            "No authorized session found. Run 'python bot.py run --script <name>' once "
+            "first to log in interactively."
+        )
+
+    scripts = await fetch_scripts_from_chat(client, cfg, from_chat, limit)
+    await client.disconnect()
+
+    if not scripts:
+        logger.error(
+            "No '# name' sections found in %r. Start your scenario with a "
+            "message like '# demo'.",
+            from_chat,
+        )
+        sys.exit(1)
+
+    if script_name is not None:
+        wanted = _slugify_script_name(script_name)
+        if wanted not in scripts:
+            logger.error(
+                "No section '# %s' found in %r. Sections found: %s",
+                script_name,
+                from_chat,
+                ", ".join(scripts) or "(none)",
+            )
+            sys.exit(1)
+        scripts = {wanted: scripts[wanted]}
+
+    for name, turns in scripts.items():
+        if not turns:
+            logger.warning("Section %r has no turns; skipping.", name)
+            continue
+        out_path = cfg.scripts_dir / f"{name}.json"
+        out_path.write_text(
+            json.dumps({"turns": turns}, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        load_script(out_path)  # validate against the same loader the bot uses
+        total_messages = sum(len(t) for t in turns)
+        click.echo(f"Exported {len(turns)} turns ({total_messages} messages) to {out_path}")
+
+
+async def _download_message_media(client: TelegramClient, msg, media_dir: Path) -> Path:
+    saved = await client.download_media(msg, file=str(media_dir) + os.sep)
+    return Path(saved)
 
 
 def _resolve_script_path(cfg: Config, script_arg: str) -> Path:
