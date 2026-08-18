@@ -372,13 +372,19 @@ AUTHORING_FETCH_LIMIT = 2000
 
 
 async def _reload_active_script_from_authoring_chat(
-    client: TelegramClient, cfg: Config, player: "ScriptPlayer", authoring_entity: str
+    client: TelegramClient,
+    cfg: Config,
+    player: "ScriptPlayer",
+    authoring_entity: str,
+    extra_author_ids: set,
 ) -> None:
     """Re-parse the authoring chat and, if it defines any '# name' scenario,
     make the most recently written one the active script - so the moment
     you finish sending a scenario there, the bot is ready to play it back
     on the very next message from the target."""
-    scripts = await fetch_scripts_from_chat(client, cfg, authoring_entity, AUTHORING_FETCH_LIMIT)
+    scripts = await fetch_scripts_from_chat(
+        client, cfg, authoring_entity, AUTHORING_FETCH_LIMIT, extra_author_ids
+    )
     if not scripts:
         return
 
@@ -491,18 +497,24 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
         authoring_entity = (
             "me" if cfg.authoring_chat.strip().lower() == "me" else cfg.authoring_chat.strip()
         )
+        authoring_extra_author_ids = await resolve_authoring_author_ids(client, cfg)
 
-        @client.on(events.NewMessage(chats=authoring_entity, outgoing=True))
+        @client.on(events.NewMessage(chats=authoring_entity))
         async def _authoring_handler(event: events.NewMessage.Event) -> None:  # noqa: ANN401
+            if not (event.out or event.sender_id in authoring_extra_author_ids):
+                return  # ignore anyone else who might post in that chat
             try:
-                await _reload_active_script_from_authoring_chat(client, cfg, player, authoring_entity)
+                await _reload_active_script_from_authoring_chat(
+                    client, cfg, player, authoring_entity, authoring_extra_author_ids
+                )
             except Exception:  # noqa: BLE001 - keep the bot alive on per-message errors
                 logger.exception("Error while reloading script from authoring chat")
 
         logger.info(
-            "Watching authoring chat %r - the latest '# name' scenario written there "
-            "goes live immediately, no restart needed.",
+            "Watching authoring chat %r (co-authors: %s) - the latest '# name' scenario "
+            "written there goes live immediately, no restart needed.",
             cfg.authoring_chat,
+            ", ".join(cfg.authoring_extra_authors) or "none",
         )
 
     logger.info(
@@ -666,18 +678,41 @@ def export_script_command(from_chat: str, script_name: Optional[str], limit: int
         sys.exit(1)
 
 
+async def resolve_authoring_author_ids(client: TelegramClient, cfg: Config) -> set:
+    """Resolve AUTHORING_EXTRA_AUTHORS usernames/ids into user ids, so
+    scenario messages written by co-authors (not just yourself) are picked
+    up from the authoring chat."""
+    ids = set()
+    for raw in cfg.authoring_extra_authors:
+        raw = raw.strip()
+        try:
+            if raw.lstrip("-").isdigit():
+                ids.add(int(raw))
+            else:
+                entity = await client.get_entity(raw if raw.startswith("@") else f"@{raw}")
+                ids.add(entity.id)
+        except Exception:  # noqa: BLE001 - a bad/unreachable username shouldn't break startup
+            logger.warning("Could not resolve authoring co-author %r; ignoring.", raw)
+    return ids
+
+
 async def fetch_scripts_from_chat(
-    client: TelegramClient, cfg: Config, from_chat: str, limit: int
+    client: TelegramClient,
+    cfg: Config,
+    from_chat: str,
+    limit: int,
+    extra_author_ids: Optional[set] = None,
 ) -> "dict[str, List[List[dict]]]":
     """Fetch and parse every '# name' scenario section out of a chat's
     message history. Shared by the one-shot 'export-script' command and the
     live authoring-chat watcher in 'run'.
     """
+    extra_author_ids = extra_author_ids or set()
     entity = "me" if from_chat.strip().lower() == "me" else from_chat.strip()
     messages = [
         msg
         async for msg in client.iter_messages(entity, limit=limit, reverse=True)
-        if msg.out and (msg.text or msg.media)
+        if (msg.out or msg.sender_id in extra_author_ids) and (msg.text or msg.media)
     ]
     return await _parse_scripts_from_messages(client, cfg, messages)
 
@@ -768,7 +803,8 @@ async def _export_script(
             "first to log in interactively."
         )
 
-    scripts = await fetch_scripts_from_chat(client, cfg, from_chat, limit)
+    extra_author_ids = await resolve_authoring_author_ids(client, cfg)
+    scripts = await fetch_scripts_from_chat(client, cfg, from_chat, limit, extra_author_ids)
     await client.disconnect()
 
     if not scripts:

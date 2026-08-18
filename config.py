@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -29,6 +29,7 @@ class Config:
     session_name: str
     target: str  # username (with or without @) or numeric user id, as string
     authoring_chat: Optional[str]  # chat to watch for live '# name' scenario edits
+    authoring_extra_authors: List[str]  # other users (besides self) allowed to write scenarios there
     notify_session_name: str  # Telethon session for the '!notify' notifier account
     notify_target: Optional[str]  # who the notifier account messages
 
@@ -77,6 +78,9 @@ def load_config() -> Config:
     session_name = os.getenv("SESSION_NAME", "userbot_session")
     target = os.getenv("TARGET_USERNAME_OR_ID")
     authoring_chat = os.getenv("AUTHORING_CHAT") or None
+    authoring_extra_authors = [
+        u.strip() for u in os.getenv("AUTHORING_EXTRA_AUTHORS", "").split(",") if u.strip()
+    ]
     notify_session_name = os.getenv("NOTIFY_SESSION_NAME", "notifier_session")
     notify_target = os.getenv("NOTIFY_TARGET") or None
 
@@ -108,6 +112,7 @@ def load_config() -> Config:
         session_name=session_name,
         target=target,  # type: ignore[arg-type]
         authoring_chat=authoring_chat,
+        authoring_extra_authors=authoring_extra_authors,
         notify_session_name=notify_session_name,
         notify_target=notify_target,
         read_delay_min=_get_float("READ_DELAY_MIN", 1.5),
