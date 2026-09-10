@@ -19,6 +19,7 @@ import logging
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -97,16 +98,22 @@ def _resolve_media_path(raw: str, script_path: Path) -> Path:
     return PROJECT_ROOT / candidate
 
 
+def _is_notify_entry(raw_msg: object) -> bool:
+    return isinstance(raw_msg, dict) and bool(raw_msg.get("notify"))
+
+
 def load_script(path: Path) -> List[List[ScriptMessage]]:
     """Load and validate a conversation script from JSON.
 
     Expected format:
         {"turns": [["msg1", "msg2"], ["msg3"], ...]}
-    Each turn is a list of 1-3 messages sent back to back. A message is
-    a plain string (text), an object {"media": "media/photo1.jpg",
-    "caption": "optional text"}, or an object {"notify": "text"} - a
-    silent off-camera notification sent via the notifier account instead
-    of the scripted chat.
+    Each turn is a list of messages sent back to back: up to 3 *visible*
+    messages (plain text, or an object {"media": "media/photo1.jpg",
+    "caption": "optional text"}) - that cap keeps the simulated typing
+    realistic - plus as many {"notify": "text"} entries as needed, since
+    those are silent off-camera notifications sent via the notifier
+    account instead of the scripted chat and carry no such realism
+    constraint (e.g. a burst of several short "analysis" cards).
     """
     if not path.exists():
         raise FileNotFoundError(f"Script file not found: {path}")
@@ -118,9 +125,15 @@ def load_script(path: Path) -> List[List[ScriptMessage]]:
 
     turns: List[List[ScriptMessage]] = []
     for i, raw_turn in enumerate(raw_turns):
-        if not isinstance(raw_turn, list) or not (1 <= len(raw_turn) <= 3):
+        if not isinstance(raw_turn, list) or not raw_turn:
             raise ValueError(
-                f"Script {path}: turn #{i} must be a list of 1-3 messages, got {raw_turn!r}"
+                f"Script {path}: turn #{i} must be a non-empty list of messages, got {raw_turn!r}"
+            )
+        visible_count = sum(1 for m in raw_turn if not _is_notify_entry(m))
+        if visible_count > 3:
+            raise ValueError(
+                f"Script {path}: turn #{i} has {visible_count} visible (non-notify) messages, "
+                "max is 3 - split extra chat lines into a new turn ('!notify' entries don't count)"
             )
 
         turn: List[ScriptMessage] = []
@@ -195,8 +208,17 @@ async def send_single_message(
                 message.notify,
             )
             return
+        send_ts = time.time()
         await notify_client.send_message(notify_target, message.notify)
-        logger.info("Sent off-camera notification: %r", message.notify)
+        # Explicit wall-clock timestamp (independent of the logging
+        # formatter's asctime settings) so actual gaps between back-to-back
+        # '!notify' sends can be read straight off the console.
+        logger.info(
+            "Sent off-camera notification at %s (unix=%.3f): %r",
+            time.strftime("%H:%M:%S", time.localtime(send_ts)) + f".{int(send_ts % 1 * 1000):03d}",
+            send_ts,
+            message.notify,
+        )
         return
 
     duration = compute_action_duration(message, cfg)
@@ -339,7 +361,21 @@ class ScriptPlayer:
             self._save_state(ScriptState(turn_index=state.turn_index, message_index=i + 1))
 
             if i < len(turn) - 1:
-                gap = random.uniform(self.cfg.inter_message_delay_min, self.cfg.inter_message_delay_max)
+                # Back-to-back '!notify' entries (e.g. a burst of short
+                # "analysis"/"date plan" cards) get their own, slower,
+                # fixed gap so each one has time to be read - independent
+                # of the normal in-chat typing pacing.
+                if turn[i].notify is not None and turn[i + 1].notify is not None:
+                    gap = self.cfg.notify_gap_delay
+                    logger.info(
+                        "Waiting notify_gap_delay=%.2fs before next '!notify' (turn %d, message %d->%d)",
+                        gap,
+                        state.turn_index + 1,
+                        i + 1,
+                        i + 2,
+                    )
+                else:
+                    gap = random.uniform(self.cfg.inter_message_delay_min, self.cfg.inter_message_delay_max)
                 await asyncio.sleep(gap)
 
         self._save_state(ScriptState(turn_index=state.turn_index + 1, message_index=0))
@@ -761,14 +797,15 @@ async def _parse_scripts_from_messages(
             continue
 
         if kind == "text" and text.startswith(NOTIFY_PREFIX):
-            if len(turns[-1]) >= 3:
-                turns.append([])
+            # '!notify' entries are silent/off-camera - they don't count
+            # against the 3-visible-message-per-turn cap, so a burst of
+            # several of them never forces an extra turn boundary here.
             notify_text = text[len(NOTIFY_PREFIX):].strip()
             if notify_text:
                 turns[-1].append({"notify": notify_text})
             continue
 
-        if len(turns[-1]) >= 3:
+        if sum(1 for m in turns[-1] if not _is_notify_entry(m)) >= 3:
             turns.append([])
 
         if kind == "media":

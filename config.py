@@ -41,6 +41,7 @@ class Config:
     typing_delay_max: float
     inter_message_delay_min: float
     inter_message_delay_max: float
+    notify_gap_delay: float  # fixed gap between back-to-back '!notify' entries in one turn
 
     # Telethon reconnection behaviour.
     reconnect_retries: int
@@ -122,6 +123,7 @@ def load_config() -> Config:
         typing_delay_max=_get_float("TYPING_DELAY_MAX", 6.0),
         inter_message_delay_min=_get_float("INTER_MESSAGE_DELAY_MIN", 0.8),
         inter_message_delay_max=_get_float("INTER_MESSAGE_DELAY_MAX", 2.5),
+        notify_gap_delay=_get_float("NOTIFY_GAP_DELAY", 2.0),
         reconnect_retries=_get_int("RECONNECT_RETRIES", 10),
         reconnect_delay=_get_float("RECONNECT_DELAY", 5.0),
         scripts_dir=PROJECT_ROOT / "scripts",
