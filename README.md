@@ -142,6 +142,51 @@ python bot.py reset --script my_scene
 This is the same as sending `/reset_script` from the target account, but you
 can do it from the command line without revealing anything in the chat.
 
+### Preview a scenario without sending anything
+
+```bash
+python bot.py run --script my_scene --dry-run
+```
+
+Prints the whole timeline (who writes what, typing/read delays, `!notify`
+lines, where a turn auto-continues) and exits — no Telegram connection.
+`DRY_RUN=1` does the same.
+
+## 7. Optional: auto-replies as "you" (`> text`)
+
+A line starting with `> ` in a scenario is a reply sent **as your own
+account** to Maria's chat, so the dialogue can run without you typing:
+
+```
+# example
+hi
+where have you been
+!notify she's upset. say: sorry, I was lost in my thoughts
+> sorry, I was lost in my thoughts
+-
+okay then
+```
+
+These lines don't count toward the 3-visible-message cap. If a turn **ends**
+with a `> text` reply, the next turn starts automatically after the `-`;
+if it ends with a normal message, the bot waits for your real reply as
+before — so you can mix automatic and manual turns. At most 10 `> text`
+replies are sent per scenario run.
+
+Setup (one time):
+
+1. Generate a session for your own account: `python make_me_session.py`
+   (asks for phone, login code, and 2FA password if you have one).
+2. Put the printed string into `.env` as `ME_SESSION_STRING`, and set
+   `MARIA_PEER` to Maria's `@username` (or phone / numeric id).
+
+If `ME_SESSION_STRING` is empty, `> text` lines are skipped with a warning
+and the bot behaves as before.
+
+> **Never commit `.env` or any `.session` file, and never share
+> `ME_SESSION_STRING`.** They are equivalent to being logged in to those
+> Telegram accounts. `.env` and `*.session` are already in `.gitignore`.
+
 ## Logs
 
 The bot logs to stdout via Python's standard `logging` module — which turn

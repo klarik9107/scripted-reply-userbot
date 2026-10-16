@@ -32,6 +32,8 @@ class Config:
     authoring_extra_authors: List[str]  # other users (besides self) allowed to write scenarios there
     notify_session_name: str  # Telethon session for the '!notify' notifier account
     notify_target: Optional[str]  # who the notifier account messages
+    me_session_string: Optional[str]  # StringSession for the '> text' auto-reply ("me") client
+    maria_peer: Optional[str]  # who the "me" client sends '> text' auto-replies to
 
     # Typing / pacing behaviour (all overridable via .env).
     read_delay_min: float
@@ -84,6 +86,8 @@ def load_config() -> Config:
     ]
     notify_session_name = os.getenv("NOTIFY_SESSION_NAME", "notifier_session")
     notify_target = os.getenv("NOTIFY_TARGET") or None
+    me_session_string = os.getenv("ME_SESSION_STRING") or None
+    maria_peer = os.getenv("MARIA_PEER") or None
 
     missing = [
         name
@@ -116,6 +120,8 @@ def load_config() -> Config:
         authoring_extra_authors=authoring_extra_authors,
         notify_session_name=notify_session_name,
         notify_target=notify_target,
+        me_session_string=me_session_string,
+        maria_peer=maria_peer,
         read_delay_min=_get_float("READ_DELAY_MIN", 1.5),
         read_delay_max=_get_float("READ_DELAY_MAX", 4.0),
         typing_chars_per_second=_get_float("TYPING_CHARS_PER_SECOND", 6.0),
