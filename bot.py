@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -173,6 +174,31 @@ def _is_visible_entry(raw_msg: object) -> bool:
     cap: Maria's own text/media. '!notify' entries and '> text' ("me")
     auto-replies are both silent/separate-channel and don't count."""
     return not _is_notify_entry(raw_msg) and not _is_me_entry(raw_msg)
+
+
+_LEADING_NUMBER_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)")
+
+
+def _leading_number(rest: str, directive: str, scenario: Optional[str]) -> float:
+    """Parse the leading number of a directive argument ('!delete 10',
+    '!wait 0,5', but also '!delete 10с после показа'). Anything after the
+    number is treated as a comment and ignored (with a log note) instead of
+    silently dropping the whole directive. Raises ValueError if the argument
+    doesn't start with a number."""
+    match = _LEADING_NUMBER_RE.match(rest)
+    if match is None:
+        raise ValueError(f"{directive} argument {rest!r} doesn't start with a number")
+    trailing = rest[match.end():].strip()
+    if trailing:
+        logger.info(
+            "Scenario %r: '%s %s' - using the number %s and ignoring the extra text %r.",
+            scenario,
+            directive,
+            rest,
+            match.group(1),
+            trailing,
+        )
+    return float(match.group(1).replace(",", "."))
 
 
 def _parse_optional_positive_float(raw_msg: dict, key: str, path: Path, i: int) -> Optional[float]:
@@ -1354,7 +1380,7 @@ async def _parse_scripts_from_messages(
             # message (not media, not notify), and only one per message.
             rest = text[len(DELETE_PREFIX):].strip()
             try:
-                seconds = float(rest)
+                seconds = _leading_number(rest, DELETE_PREFIX, current_name)
                 if seconds <= 0:
                     raise ValueError("delete_after must be positive")
             except ValueError:
@@ -1383,7 +1409,7 @@ async def _parse_scripts_from_messages(
             # visible message (text or media), but not a '!notify' entry.
             rest = text[len(WAIT_PREFIX):].strip()
             try:
-                seconds = float(rest)
+                seconds = _leading_number(rest, WAIT_PREFIX, current_name)
                 if seconds <= 0:
                     raise ValueError("wait_before_next must be positive")
             except ValueError:
@@ -1414,7 +1440,7 @@ async def _parse_scripts_from_messages(
             # Must directly follow a media entry - not text, not notify.
             rest = text[len(TIMER_PREFIX):].strip()
             try:
-                ttl_seconds = int(rest)
+                ttl_seconds = int(_leading_number(rest, TIMER_PREFIX, current_name))
                 if not 1 <= ttl_seconds <= 60:
                     raise ValueError("ttl must be between 1 and 60 seconds")
             except ValueError:
