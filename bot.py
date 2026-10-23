@@ -804,6 +804,10 @@ async def resolve_target_id(client: TelegramClient, target: str) -> int:
 
 AUTHORING_FETCH_LIMIT = 2000
 
+# How long to wait after the LAST new authoring-chat message before
+# re-parsing it, so a multi-message scenario is reloaded once, not per line.
+AUTHORING_RELOAD_DEBOUNCE = 2.0
+
 
 async def _reload_active_script_from_authoring_chat(
     client: TelegramClient,
@@ -1006,16 +1010,35 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
         )
         authoring_extra_author_ids = await resolve_authoring_author_ids(client, cfg)
 
+        # The reload re-reads the whole authoring chat and can take several
+        # seconds. Running it inside the update handler would block every
+        # other update (client uses sequential_updates=True) - including the
+        # target's message that Maria should be answering - so it runs as a
+        # background task instead. It's also debounced: each new authoring
+        # message cancels the pending reload and restarts a short timer, so
+        # typing a scenario line by line triggers ONE reload at the end
+        # rather than one per line.
+        reload_state: dict = {"task": None}
+
+        async def _debounced_reload() -> None:
+            try:
+                await asyncio.sleep(AUTHORING_RELOAD_DEBOUNCE)
+                await _reload_active_script_from_authoring_chat(
+                    client, cfg, player, authoring_entity, authoring_extra_author_ids
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep the bot alive on reload errors
+                logger.exception("Error while reloading script from authoring chat")
+
         @client.on(events.NewMessage(chats=authoring_entity))
         async def _authoring_handler(event: events.NewMessage.Event) -> None:  # noqa: ANN401
             if not (event.out or event.sender_id in authoring_extra_author_ids):
                 return  # ignore anyone else who might post in that chat
-            try:
-                await _reload_active_script_from_authoring_chat(
-                    client, cfg, player, authoring_entity, authoring_extra_author_ids
-                )
-            except Exception:  # noqa: BLE001 - keep the bot alive on per-message errors
-                logger.exception("Error while reloading script from authoring chat")
+            pending = reload_state["task"]
+            if pending is not None and not pending.done():
+                pending.cancel()
+            reload_state["task"] = asyncio.create_task(_debounced_reload())
 
         logger.info(
             "Watching authoring chat %r (co-authors: %s) - the latest '# name' scenario "
@@ -1572,7 +1595,18 @@ async def _export_script(
 
 
 async def _download_message_media(client: TelegramClient, msg, media_dir: Path) -> Path:
-    saved = await client.download_media(msg, file=str(media_dir) + os.sep)
+    """Download a message's media once and reuse it on every later reload.
+
+    The authoring chat is re-parsed from scratch on every new message, so
+    without a cache each reload re-downloaded every photo (slow, and with a
+    directory target Telethon keeps adding ' (1)', ' (2)' ... duplicates).
+    The file is named after the message id, which is stable, so an existing
+    file means it's already been downloaded."""
+    stem = media_dir / f"msg{msg.id}"
+    existing = sorted(media_dir.glob(f"msg{msg.id}.*"))
+    if existing:
+        return existing[0]
+    saved = await client.download_media(msg, file=str(stem))
     return Path(saved)
 
 
