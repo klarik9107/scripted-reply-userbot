@@ -1602,12 +1602,28 @@ async def _download_message_media(client: TelegramClient, msg, media_dir: Path) 
     directory target Telethon keeps adding ' (1)', ' (2)' ... duplicates).
     The file is named after the message id, which is stable, so an existing
     file means it's already been downloaded."""
-    stem = media_dir / f"msg{msg.id}"
-    existing = sorted(media_dir.glob(f"msg{msg.id}.*"))
-    if existing:
-        return existing[0]
-    saved = await client.download_media(msg, file=str(stem))
-    return Path(saved)
+    # Only a COMPLETE file may ever sit under its final name: the reload can
+    # be cancelled mid-download (debounce), and a leftover empty/partial file
+    # that the cache then trusted made every later send fail with
+    # FilePartsInvalidError. So download to a '.part' file and rename it only
+    # once finished, and never trust a zero-size cached file.
+    for candidate in sorted(media_dir.glob(f"msg{msg.id}.*")):
+        if candidate.suffix == ".part":
+            continue
+        if candidate.stat().st_size > 0:
+            return candidate
+        candidate.unlink()  # empty leftover from an interrupted download
+
+    ext = (getattr(getattr(msg, "file", None), "ext", None) or ".jpg")
+    final = media_dir / f"msg{msg.id}{ext}"
+    part = media_dir / f"msg{msg.id}.part"
+    part.unlink(missing_ok=True)
+    saved = await client.download_media(msg, file=str(part))
+    if not saved or not Path(saved).exists() or Path(saved).stat().st_size == 0:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded media for message {msg.id} is empty or missing")
+    os.replace(saved, final)
+    return final
 
 
 def _resolve_script_path(cfg: Config, script_arg: str) -> Path:
