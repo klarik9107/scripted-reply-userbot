@@ -39,6 +39,8 @@ from telethon.sessions import StringSession
 from telethon.tl.types import User
 
 from config import PROJECT_ROOT, Config, ConfigError, load_config
+import media_wait
+from media_wait import BOT_NOTICE_PREFIX, MEDIA_COMMANDS
 from state_store import ScriptState, StateStore
 
 RESET_COMMAND = "/reset_script"
@@ -162,7 +164,9 @@ def _is_notify_entry(raw_msg: object) -> bool:
 
 
 def _is_media_entry(raw_msg: object) -> bool:
-    return isinstance(raw_msg, dict) and bool(raw_msg.get("media"))
+    # A '<фото>'/'<видео>' placeholder counts too, so '!timer' can attach to
+    # it before the real file has arrived.
+    return isinstance(raw_msg, dict) and bool(raw_msg.get("media") or raw_msg.get("placeholder"))
 
 
 def _is_me_entry(raw_msg: object) -> bool:
@@ -279,7 +283,12 @@ def load_script(path: Path) -> List[List[ScriptMessage]]:
                     raise ValueError(f"Script {path}: turn #{i} contains an empty text message")
                 turn.append(ScriptMessage(text=raw_msg))
             elif isinstance(raw_msg, dict) and raw_msg.get("notify"):
-                turn.append(ScriptMessage(notify=str(raw_msg["notify"])))
+                wait_before_next = _parse_optional_positive_float(
+                    raw_msg, "wait_before_next", path, i
+                )
+                turn.append(
+                    ScriptMessage(notify=str(raw_msg["notify"]), wait_before_next=wait_before_next)
+                )
             elif isinstance(raw_msg, dict) and raw_msg.get("me"):
                 me_text = raw_msg["me"]
                 if not isinstance(me_text, str) or not me_text.strip():
@@ -774,6 +783,16 @@ class ScriptPlayer:
                     gap = random.uniform(self.cfg.inter_message_delay_min, self.cfg.inter_message_delay_max)
                 await asyncio.sleep(gap)
 
+        if ended_with_sent_me_reply and turn[-1].wait_before_next is not None:
+            # A '!wait' after the turn's last line (a me-reply) has no "next
+            # message in this turn" to delay, but this turn auto-continues
+            # into the next one - so honour the pause before that happens.
+            logger.info(
+                "Waiting wait_before_next=%.2fs before auto-continuing to the next turn",
+                turn[-1].wait_before_next,
+            )
+            await asyncio.sleep(turn[-1].wait_before_next)
+
         self._save_state(ScriptState(turn_index=state.turn_index + 1, message_index=0))
         return ended_with_sent_me_reply
 
@@ -815,22 +834,39 @@ async def _reload_active_script_from_authoring_chat(
     player: "ScriptPlayer",
     authoring_entity: str,
     extra_author_ids: set,
-) -> None:
+) -> Optional[float]:
     """Re-parse the authoring chat and, if it defines any '# name' scenario,
     make the most recently written one the active script - so the moment
     you finish sending a scenario there, the bot is ready to play it back
-    on the very next message from the target."""
+    on the very next message from the target.
+
+    A scenario with '<фото>'/'<видео>' placeholders is NOT activated until
+    all its media has arrived (see media_wait.py); in that case the bot
+    answers in the authoring chat instead. Returns how many seconds from
+    now to re-run this (the media-wait timeout), or None."""
+    meta: dict = {}
     scripts = await fetch_scripts_from_chat(
-        client, cfg, authoring_entity, AUTHORING_FETCH_LIMIT, extra_author_ids
+        client, cfg, authoring_entity, AUTHORING_FETCH_LIMIT, extra_author_ids, meta
     )
     if not scripts:
-        return
+        return None
 
     name = next(reversed(scripts))
+
+    async def say(text: str) -> bool:
+        return await _say_in_authoring_chat(client, authoring_entity, text)
+
+    blocked, recheck_in, just_completed = await media_wait.announce(
+        say, cfg.state_dir, name, meta.get(name)
+    )
+    if blocked:
+        logger.info("Scenario %r is waiting for media (or was cancelled); not switching yet.", name)
+        return recheck_in
+
     turns_raw = scripts[name]
     if not turns_raw:
         logger.warning("Latest scenario %r in authoring chat has no turns yet; not switching.", name)
-        return
+        return None
 
     per_turn_counts = [
         (
@@ -858,6 +894,50 @@ async def _reload_active_script_from_authoring_chat(
         name,
         len(turns),
     )
+    media_wait.set_last_activated(cfg.state_dir, name)
+    if just_completed:
+        media_wait.mark_completed(cfg.state_dir)
+        await say(f"Готово, сценарий «{name}» запущен")
+    return None
+
+
+async def _say_in_authoring_chat(client: TelegramClient, entity, text: str) -> bool:
+    """Post a bot notice into the authoring chat. Prefixed so the re-parse
+    (which also reads our own outgoing messages) can recognise and skip it."""
+    try:
+        await client.send_message(entity, f"{BOT_NOTICE_PREFIX} {text}")
+        return True
+    except Exception:  # noqa: BLE001 - a failed notice must never break a reload
+        logger.exception("Could not post a notice in the authoring chat")
+        return False
+
+
+async def _send_media_status(
+    client: TelegramClient, cfg: Config, player: "ScriptPlayer", entity: str, extra_author_ids: set
+) -> None:
+    """'/status': what is the latest scenario still missing?"""
+    meta: dict = {}
+    scripts = await fetch_scripts_from_chat(
+        client, cfg, entity, AUTHORING_FETCH_LIMIT, extra_author_ids, meta
+    )
+    name = next(reversed(scripts)) if scripts else None
+    await _say_in_authoring_chat(
+        client, entity, media_wait.status_text(meta.get(name) if name else None, player.script_name)
+    )
+
+
+async def _rerun_last_scenario(
+    client: TelegramClient, cfg: Config, player: "ScriptPlayer", entity: str
+) -> None:
+    """'/rerun': replay the last activated scenario from turn 0, reusing the
+    media files already saved on disk - nothing needs to be re-sent."""
+    name = media_wait.load_state(cfg.state_dir).get("last_activated")
+    path = cfg.scripts_dir / f"{name}.json" if name else None
+    if not path or not path.exists():
+        await _say_in_authoring_chat(client, entity, "Нет запущенного сценария для перезапуска")
+        return
+    await player.load_script(name, load_script(path))
+    await _say_in_authoring_chat(client, entity, f"Сценарий «{name}» перезапущен с начала")
 
 
 # --------------------------------------------------------------------------
@@ -1018,14 +1098,35 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
         # message cancels the pending reload and restarts a short timer, so
         # typing a scenario line by line triggers ONE reload at the end
         # rather than one per line.
-        reload_state: dict = {"task": None}
+        reload_state: dict = {"task": None, "recheck": None}
+
+        def _cancel(task_key: str) -> None:
+            task = reload_state[task_key]
+            if task is not None and not task.done():
+                task.cancel()
+
+        async def _recheck_later(delay: float) -> None:
+            # A scenario waiting for media must time out even if nothing new
+            # is sent to the chat, so re-run the reload when the wait expires.
+            try:
+                await asyncio.sleep(delay)
+                await _reload_active_script_from_authoring_chat(
+                    client, cfg, player, authoring_entity, authoring_extra_author_ids
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep the bot alive on reload errors
+                logger.exception("Error while re-checking the media wait")
 
         async def _debounced_reload() -> None:
             try:
                 await asyncio.sleep(AUTHORING_RELOAD_DEBOUNCE)
-                await _reload_active_script_from_authoring_chat(
+                recheck_in = await _reload_active_script_from_authoring_chat(
                     client, cfg, player, authoring_entity, authoring_extra_author_ids
                 )
+                if recheck_in:
+                    _cancel("recheck")
+                    reload_state["recheck"] = asyncio.create_task(_recheck_later(recheck_in))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - keep the bot alive on reload errors
@@ -1035,9 +1136,21 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
         async def _authoring_handler(event: events.NewMessage.Event) -> None:  # noqa: ANN401
             if not (event.out or event.sender_id in authoring_extra_author_ids):
                 return  # ignore anyone else who might post in that chat
-            pending = reload_state["task"]
-            if pending is not None and not pending.done():
-                pending.cancel()
+            text = (event.raw_text or "").strip()
+            if text.startswith(BOT_NOTICE_PREFIX):
+                return  # our own notice - nothing to reload
+            if text == "/status":
+                asyncio.create_task(
+                    _send_media_status(
+                        client, cfg, player, authoring_entity, authoring_extra_author_ids
+                    )
+                )
+                return
+            if text == "/rerun":
+                asyncio.create_task(_rerun_last_scenario(client, cfg, player, authoring_entity))
+                return
+            _cancel("task")
+            _cancel("recheck")
             reload_state["task"] = asyncio.create_task(_debounced_reload())
 
         logger.info(
@@ -1139,6 +1252,8 @@ def print_dry_run_timeline(cfg: Config, turns: List[List[ScriptMessage]]) -> Non
                     )
 
         if turn and turn[-1].is_me:
+            if turn[-1].wait_before_next is not None:
+                click.echo(f"  [wait {turn[-1].wait_before_next:.1f}s - wait_before_next]")
             click.echo("  -> turn ends with a me-reply: auto-continues to next turn\n")
         else:
             click.echo("  -> waiting for your real reply before next turn\n")
@@ -1305,23 +1420,27 @@ async def fetch_scripts_from_chat(
     from_chat: str,
     limit: int,
     extra_author_ids: Optional[set] = None,
+    meta: Optional[dict] = None,
 ) -> "dict[str, List[List[dict]]]":
     """Fetch and parse every '# name' scenario section out of a chat's
     message history. Shared by the one-shot 'export-script' command and the
-    live authoring-chat watcher in 'run'.
+    live authoring-chat watcher in 'run'. `meta`, if given, is filled with
+    per-scenario media-wait bookkeeping (see media_wait.py).
     """
     extra_author_ids = extra_author_ids or set()
     entity = "me" if from_chat.strip().lower() == "me" else from_chat.strip()
     messages = [
         msg
         async for msg in client.iter_messages(entity, limit=limit, reverse=True)
-        if (msg.out or msg.sender_id in extra_author_ids) and (msg.text or msg.media)
+        if (msg.out or msg.sender_id in extra_author_ids)
+        and (msg.text or msg.media)
+        and not (msg.text or "").startswith(BOT_NOTICE_PREFIX)
     ]
-    return await _parse_scripts_from_messages(client, cfg, messages)
+    return await _parse_scripts_from_messages(client, cfg, messages, meta)
 
 
 async def _parse_scripts_from_messages(
-    client: TelegramClient, cfg: Config, messages: list
+    client: TelegramClient, cfg: Config, messages: list, meta: Optional[dict] = None
 ) -> "dict[str, List[List[dict]]]":
     # A single Telegram message may itself contain multiple newline-separated
     # lines (very common when typing on a phone: each Enter starts a new
@@ -1330,6 +1449,8 @@ async def _parse_scripts_from_messages(
     # media message - so '# name' headers and '-' delimiters are recognised
     # regardless of whether they arrived as separate messages or as lines
     # within one message.
+    if meta is None:
+        meta = {}
     tokens: List[tuple] = []
     for msg in messages:
         if msg.media:
@@ -1339,7 +1460,7 @@ async def _parse_scripts_from_messages(
             for line in (msg.text or "").splitlines():
                 line = line.strip()
                 if line:
-                    tokens.append(("text", line))
+                    tokens.append(("text", line, msg))
 
     scripts: "dict[str, List[List[dict]]]" = {}
     current_name: Optional[str] = None
@@ -1362,16 +1483,48 @@ async def _parse_scripts_from_messages(
                 # of the one you just rewrote.
                 del scripts[current_name]
             scripts[current_name] = [[]]
+            meta[current_name] = media_wait.new_meta(token[2])
             continue
 
         if current_name is None:
             continue  # ignore stray content before the first '# name' header
 
         turns = scripts[current_name]
+        info = meta[current_name]
+
+        if kind == "text" and text in MEDIA_COMMANDS:
+            # '/skip' leaves the next waiting placeholder empty, '/cancel'
+            # drops the scenario that is still waiting for media; '/status'
+            # and '/rerun' are acted on by the chat handler. None of them is
+            # scenario text.
+            if text == "/skip":
+                pending = media_wait.first_pending(info)
+                if pending is not None:
+                    pending["state"] = "skipped"
+            elif text == "/cancel" and media_wait.first_pending(info) is not None:
+                info["cancelled"] = True
+            continue
+
+        if info["cancelled"]:
+            continue  # everything after '/cancel' belongs to no scenario
 
         if kind == "text" and text == TURN_DELIMITER:
             if turns[-1]:
                 turns.append([])
+            continue
+
+        placeholder = media_wait.parse_placeholder(text) if kind == "text" else None
+        if placeholder is not None:
+            # '<фото>' / '<видео>' [caption] - the real file is sent AFTER the
+            # scenario text and substituted in order (see media_wait.py).
+            if sum(1 for m in turns[-1] if _is_visible_entry(m)) >= 3:
+                turns.append([])
+            ph_kind, ph_caption = placeholder
+            ph_entry: dict = {"placeholder": ph_kind}
+            if ph_caption:
+                ph_entry["caption"] = ph_caption
+            turns[-1].append(ph_entry)
+            info["placeholders"].append({"kind": ph_kind, "state": "pending", "entry": ph_entry})
             continue
 
         if kind == "text" and text.startswith(ME_PREFIX):
@@ -1443,7 +1596,10 @@ async def _parse_scripts_from_messages(
                     rest,
                 )
                 continue
-            if turns[-1] and not _is_notify_entry(turns[-1][-1]):
+            if turns[-1]:
+                # Attaches to whatever came right before it - a visible
+                # message, a '> text' me-reply, or a '!notify' (the pause
+                # then happens after the notification, before the next line).
                 last_entry = turns[-1][-1]
                 if isinstance(last_entry, str):
                     turns[-1][-1] = {"text": last_entry, "wait_before_next": seconds}
@@ -1451,8 +1607,8 @@ async def _parse_scripts_from_messages(
                     last_entry["wait_before_next"] = seconds
             else:
                 logger.warning(
-                    "Scenario %r has '!wait' that doesn't directly follow a visible "
-                    "message (text or media, not '!notify'); skipping the marker.",
+                    "Scenario %r has '!wait' at the very start of a turn - there is "
+                    "nothing before it to pause after; skipping the marker.",
                     current_name,
                 )
             continue
@@ -1510,6 +1666,35 @@ async def _parse_scripts_from_messages(
                 turns[-1].append(entry)
             continue
 
+        if kind == "media":
+            waiting = media_wait.first_pending(info)
+            if waiting is not None:
+                # This scenario is still waiting for media: the file fills
+                # the next placeholder instead of being appended inline.
+                _, msg, media_caption = token
+                if media_wait.media_kind(msg) != waiting["kind"]:
+                    info["wrong"].append({"id": msg.id, "expected": waiting["kind"]})
+                    continue
+                media_dir = cfg.scripts_dir / "media" / current_name
+                media_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    saved_path = await _download_message_media(client, msg, media_dir)
+                except Exception as exc:  # noqa: BLE001 - leave the placeholder waiting
+                    logger.warning(
+                        "Failed to download media for a placeholder in scenario %r (%s: %s)",
+                        current_name,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+                ph = waiting["entry"]
+                ph.pop("placeholder", None)
+                ph["media"] = f"media/{current_name}/{saved_path.name}"
+                if media_caption and "caption" not in ph:
+                    ph["caption"] = media_caption
+                waiting["state"] = "filled"
+                continue
+
         if sum(1 for m in turns[-1] if _is_visible_entry(m)) >= 3:
             turns.append([])
 
@@ -1537,6 +1722,11 @@ async def _parse_scripts_from_messages(
         else:
             turns[-1].append(text)
 
+    for scenario_name, scenario_turns in scripts.items():
+        scenario_info = meta.get(scenario_name)
+        if scenario_info and not media_wait.is_unresolved(scenario_info):
+            media_wait.finalize_scenario(scenario_turns, scenario_info)
+
     # Drop any trailing empty turn left over from a dangling '-'.
     for turns in scripts.values():
         if turns and not turns[-1]:
@@ -1558,7 +1748,8 @@ async def _export_script(
         )
 
     extra_author_ids = await resolve_authoring_author_ids(client, cfg)
-    scripts = await fetch_scripts_from_chat(client, cfg, from_chat, limit, extra_author_ids)
+    meta: dict = {}
+    scripts = await fetch_scripts_from_chat(client, cfg, from_chat, limit, extra_author_ids, meta)
     await client.disconnect()
 
     if not scripts:
@@ -1584,6 +1775,13 @@ async def _export_script(
     for name, turns in scripts.items():
         if not turns:
             logger.warning("Section %r has no turns; skipping.", name)
+            continue
+        if media_wait.is_unresolved(meta.get(name)):
+            logger.warning(
+                "Section %r still has unfilled <фото>/<видео> placeholders (or was "
+                "cancelled); send its media in the chat first. Skipping.",
+                name,
+            )
             continue
         out_path = cfg.scripts_dir / f"{name}.json"
         out_path.write_text(
