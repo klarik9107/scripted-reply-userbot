@@ -1153,6 +1153,12 @@ async def run_bot(cfg: Config, script_path: Path) -> None:
             _cancel("recheck")
             reload_state["task"] = asyncio.create_task(_debounced_reload())
 
+        # Pick up the latest scenario from the chat on startup too. Without
+        # this a restart falls back to the --script given on the command
+        # line until something new is written to the chat, so a scenario
+        # prepared before the restart silently "doesn't start".
+        reload_state["task"] = asyncio.create_task(_debounced_reload())
+
         logger.info(
             "Watching authoring chat %r (co-authors: %s) - the latest '# name' scenario "
             "written there goes live immediately, no restart needed.",
